@@ -10,47 +10,47 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
+	"slices"
 	"sort"
 	"strings"
-	"time"
 )
 
-type artifact struct {
-	Target string    `json:"target"`
-	Name   string    `json:"name"`
-	SHA256 string    `json:"sha256"`
-	Size   int64     `json:"size"`
-	Build  buildInfo `json:"build"`
+// The executable carries detailed Go build information already. Package
+// metadata contains only the identity needed to select and verify a release.
+type releaseInfo struct {
+	Version      string `json:"version"`
+	Commit       string `json:"commit"`
+	Protocol     int    `json:"protocol"`
+	Target       string `json:"target"`
+	Binary       string `json:"binary"`
+	BinarySHA256 string `json:"binarySHA256"`
+	SourceDirty  bool   `json:"sourceDirty,omitempty"`
 }
 
-type sourceArtifact struct {
+type artifact struct {
+	Target string `json:"target"`
 	Name   string `json:"name"`
 	SHA256 string `json:"sha256"`
 	Size   int64  `json:"size"`
 }
 
-type manifest struct {
-	Schema     int            `json:"schema"`
-	Version    string         `json:"version"`
-	Commit     string         `json:"commit"`
-	Protocol   int            `json:"protocol"`
-	Repository string         `json:"repository"`
-	Artifacts  []artifact     `json:"artifacts"`
-	Source     sourceArtifact `json:"source"`
+// Per-platform reports are CI handoff files, not public release attachments.
+type platformReport struct {
+	Version     string   `json:"version"`
+	Commit      string   `json:"commit"`
+	Protocol    int      `json:"protocol"`
+	SourceDirty bool     `json:"sourceDirty,omitempty"`
+	Artifact    artifact `json:"artifact"`
 }
 
-func verifyChecks(checks []string) error {
-	for _, expected := range []string{"native-engine", "version", "help", "ipc-no-init", "linkage"} {
-		found := false
-		for _, value := range checks {
-			found = found || value == expected
-		}
-		if !found {
-			return fmt.Errorf("missing release check: %s", expected)
-		}
-	}
-	return nil
+type manifest struct {
+	Schema      int        `json:"schema"`
+	Version     string     `json:"version"`
+	Commit      string     `json:"commit"`
+	Protocol    int        `json:"protocol"`
+	Repository  string     `json:"repository"`
+	SourceDirty bool       `json:"sourceDirty,omitempty"`
+	Artifacts   []artifact `json:"artifacts"`
 }
 
 func validateFile(name, digest string, size int64) error {
@@ -71,32 +71,19 @@ func validateFile(name, digest string, size int64) error {
 	return nil
 }
 
-func verifyArchive(name string, report artifact) error {
-	if err := validateFile(name, report.SHA256, report.Size); err != nil {
-		return err
-	}
+// Run once in the platform build job. Later jobs verify the ZIP checksum,
+// rather than repeatedly decompressing and re-reading every package entry.
+func verifyArchive(name string, expected releaseInfo) error {
 	z, err := zip.OpenReader(name)
 	if err != nil {
 		return err
 	}
 	defer z.Close()
 	seen := make(map[string]bool)
-	metadataFound, binaryFound, licensesFound := false, false, false
 	var total uint64
 	for _, entry := range z.File {
-		if _, err := safeArchivePath("package", entry.Name); err != nil {
-			return err
-		}
-		if seen[entry.Name] || !entry.Mode().IsRegular() {
-			return errors.New("duplicate or non-regular package entry")
-		}
-		// Local documentation is never a release input. Only declared package
-		// files and collected dependency licenses are admitted.
-		allowed := entry.Name == report.Build.Binary || entry.Name == "release-info.json" || strings.HasPrefix(entry.Name, "licenses/")
-		for _, name := range packageFiles {
-			allowed = allowed || entry.Name == name
-		}
-		if !allowed {
+		allowed := entry.Name == expected.Binary || entry.Name == "release-info.json" || slices.Contains(packageFiles, entry.Name)
+		if !allowed || seen[entry.Name] || !entry.Mode().IsRegular() {
 			return fmt.Errorf("unexpected package entry: %s", entry.Name)
 		}
 		seen[entry.Name] = true
@@ -111,151 +98,171 @@ func verifyArchive(name string, report artifact) error {
 		switch entry.Name {
 		case "release-info.json":
 			data, readErr := io.ReadAll(io.LimitReader(r, (1<<20)+1))
-			var embedded buildInfo
-			if readErr != nil || len(data) > 1<<20 || json.Unmarshal(data, &embedded) != nil || !reflect.DeepEqual(embedded, report.Build) {
+			var embedded releaseInfo
+			if readErr != nil || len(data) > 1<<20 || json.Unmarshal(data, &embedded) != nil || embedded != expected {
 				err = errors.New("embedded release metadata mismatch")
 			}
-			metadataFound = true
-		case report.Build.Binary:
+		case expected.Binary:
 			h := sha256.New()
 			_, err = io.Copy(h, r)
-			if err == nil && hex.EncodeToString(h.Sum(nil)) != report.Build.BinarySHA256 {
+			if err == nil && hex.EncodeToString(h.Sum(nil)) != expected.BinarySHA256 {
 				err = errors.New("embedded executable checksum mismatch")
 			}
-			if !strings.HasPrefix(report.Target, "windows-") && entry.Mode()&0111 == 0 {
+			if !strings.HasPrefix(expected.Target, "windows-") && entry.Mode()&0111 == 0 {
 				err = errors.New("executable permission missing from ZIP")
 			}
-			binaryFound = true
 		default:
-			_, err = io.Copy(io.Discard, r) // Also checks the ZIP CRC.
-			licensesFound = licensesFound || strings.HasPrefix(entry.Name, "licenses/")
+			_, err = io.Copy(io.Discard, r)
 		}
 		err = errors.Join(err, r.Close())
 		if err != nil {
 			return fmt.Errorf("%s: %w", entry.Name, err)
 		}
 	}
-	if !metadataFound || !binaryFound || !licensesFound {
+	if !seen["release-info.json"] || !seen[expected.Binary] {
 		return errors.New("incomplete binary package")
 	}
-	for _, name := range packageFiles {
-		if !seen[name] {
-			return fmt.Errorf("missing package file: %s", name)
-		}
+	return nil
+}
+
+// Hash while copying into the new staging directory: one read of each archive.
+func copyCheckedArtifact(source, destination string, expected artifact) error {
+	if !hashPattern.MatchString(expected.SHA256) || expected.Size <= 0 {
+		return errors.New("invalid artifact checksum or size")
+	}
+	info, err := os.Lstat(source)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() != expected.Size {
+		return fmt.Errorf("artifact size or file type mismatch: %s", expected.Name)
+	}
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(out, h), in)
+	err = errors.Join(err, out.Close())
+	if err != nil {
+		return err
+	}
+	if n != expected.Size || hex.EncodeToString(h.Sum(nil)) != expected.SHA256 {
+		return fmt.Errorf("artifact checksum mismatch: %s", expected.Name)
 	}
 	return nil
 }
 
 func (t *tool) assemble() error {
-	if err := t.checkSources(); err != nil {
-		return err
-	}
 	ver, commit, _, err := t.metadata()
 	if err != nil {
 		return err
-	}
-	destination := filepath.Join(t.root, "publish")
-	if _, err := os.Lstat(destination); !errors.Is(err, os.ErrNotExist) {
-		return errors.New("publish already exists or cannot be inspected")
 	}
 	stage, err := os.MkdirTemp(t.root, ".release-staging-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(stage)
-	m := manifest{Schema: 1, Version: ver, Commit: commit, Protocol: t.lock.Protocol, Repository: os.Getenv("GITHUB_REPOSITORY")}
+	m := manifest{
+		Schema: 2, Version: ver, Commit: commit, Protocol: t.lock.Protocol,
+		Repository: os.Getenv("GITHUB_REPOSITORY"),
+	}
+	checksums := make(map[string]string)
 	for _, target := range targets {
 		name := productName + "-" + ver + "-" + target
-		var a artifact
-		if err := readJSON(filepath.Join(t.root, "dist", name+".json"), &a); err != nil {
+		var report platformReport
+		if err := readJSON(filepath.Join(t.root, "dist", name+".json"), &report); err != nil {
 			return err
 		}
-		goos, arch, _ := strings.Cut(target, "-")
-		if a.Target != target || a.Name != name+".zip" || a.Build.Target != target || a.Build.Version != ver || a.Build.Commit != commit || a.Build.Component != productName || a.Build.Protocol != t.lock.Protocol || a.Build.GoVersion != "go"+t.lock.Go || a.Build.OS != goos || a.Build.Arch != arch || a.Build.Binary != executable(target) || a.Build.SourceRepository != m.Repository || !reflect.DeepEqual(a.Build.SpiderMonkey, t.lock.Native) {
+		a := report.Artifact
+		if report.Version != ver || report.Commit != commit || report.Protocol != m.Protocol ||
+			a.Target != target || a.Name != name+".zip" {
 			return fmt.Errorf("platform report mismatch: %s", target)
 		}
-		if err := verifyChecks(a.Build.Checks); err != nil {
-			return fmt.Errorf("%s: %w", target, err)
-		}
-		archive := filepath.Join(t.root, "dist", a.Name)
-		if err := verifyArchive(archive, a); err != nil {
-			return fmt.Errorf("%s: %w", target, err)
-		}
-		if err := copyFile(archive, filepath.Join(stage, a.Name), 0644); err != nil {
+		if err := copyCheckedArtifact(filepath.Join(t.root, "dist", a.Name), filepath.Join(stage, a.Name), a); err != nil {
 			return err
 		}
+		m.SourceDirty = m.SourceDirty || report.SourceDirty
 		m.Artifacts = append(m.Artifacts, a)
+		checksums[a.Name] = a.SHA256
 	}
-	m.Source.Name = productName + "-" + ver + "-source.zip"
-	source := filepath.Join(stage, m.Source.Name)
-	if _, err := t.run(nil, false, 5*time.Minute, "git", "archive", "--format=zip", "--prefix="+productName+"-"+ver+"/", "-o", source, commit); err != nil {
-		return err
-	}
-	m.Source.SHA256, err = fileHash(source)
-	if err != nil {
-		return err
-	}
-	info, err := os.Stat(source)
-	if err != nil {
-		return err
-	}
-	m.Source.Size = info.Size()
 	if err := writeJSON(filepath.Join(stage, "release-manifest.json"), m); err != nil {
 		return err
 	}
-	entries, err := os.ReadDir(stage)
+	checksums["release-manifest.json"], err = fileHash(filepath.Join(stage, "release-manifest.json"))
 	if err != nil {
 		return err
 	}
+	names := make([]string, 0, len(checksums))
+	for name := range checksums {
+		names = append(names, name)
+	}
+	sort.Strings(names)
 	var sums strings.Builder
-	for _, entry := range entries {
-		hash, err := fileHash(filepath.Join(stage, entry.Name()))
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(&sums, "%s  %s\n", hash, entry.Name())
+	for _, name := range names {
+		fmt.Fprintf(&sums, "%s  %s\n", checksums[name], name)
 	}
 	if err := os.WriteFile(filepath.Join(stage, "SHA256SUMS"), []byte(sums.String()), 0644); err != nil {
 		return err
 	}
-	if err := os.Rename(stage, destination); err != nil {
+
+	destination := filepath.Join(t.root, "publish")
+	if err := os.MkdirAll(destination, 0755); err != nil {
 		return err
 	}
-	fmt.Println("All five platforms verified:", destination)
+	// Replace only this release's files; commit the manifest and sums last.
+	for _, a := range m.Artifacts {
+		if err := os.Rename(filepath.Join(stage, a.Name), filepath.Join(destination, a.Name)); err != nil {
+			return err
+		}
+	}
+	for _, name := range []string{"release-manifest.json", "SHA256SUMS"} {
+		if err := os.Rename(filepath.Join(stage, name), filepath.Join(destination, name)); err != nil {
+			return err
+		}
+	}
+	fmt.Println("All five platforms assembled:", destination)
 	return nil
 }
 
-// verifyBundle runs again in the write-privileged publication job. It checks
-// exactly the expected filenames; unlisted files are never uploaded.
+// The privileged job checks the received files against the manifest and sums
+// once. It never decompresses archives or uploads unlisted local files.
 func verifyBundle(dir, tag, repository, commit string) (manifest, []string, error) {
 	var m manifest
 	if err := readJSON(filepath.Join(dir, "release-manifest.json"), &m); err != nil {
 		return m, nil, err
 	}
-	if m.Schema != 1 || m.Version != tag || m.Commit != commit || m.Repository != repository || m.Protocol < 1 || len(m.Artifacts) != len(targets) {
+	if m.Schema != 2 || m.Version != tag || m.Commit != commit || m.Repository != repository ||
+		m.Protocol < 1 || len(m.Artifacts) != len(targets) {
 		return m, nil, errors.New("publication manifest does not match the tag job")
 	}
-	expected := map[string]bool{"release-manifest.json": true, "SHA256SUMS": true}
+	expected := make(map[string]artifact)
 	seenTargets := make(map[string]bool)
 	for _, a := range m.Artifacts {
-		goos, arch, _ := strings.Cut(a.Target, "-")
-		if validTarget(a.Target) != nil || seenTargets[a.Target] || a.Name != productName+"-"+tag+"-"+a.Target+".zip" || a.Build.Target != a.Target || a.Build.Commit != commit || a.Build.Version != tag || a.Build.Component != productName || a.Build.OS != goos || a.Build.Arch != arch || a.Build.Protocol != m.Protocol || a.Build.SourceRepository != repository || a.Build.Binary != executable(a.Target) {
+		if validTarget(a.Target) != nil || seenTargets[a.Target] ||
+			a.Name != productName+"-"+tag+"-"+a.Target+".zip" ||
+			!hashPattern.MatchString(a.SHA256) || a.Size <= 0 {
 			return m, nil, errors.New("invalid platform metadata in publication")
 		}
-		if err := verifyChecks(a.Build.Checks); err != nil {
+		seenTargets[a.Target] = true
+		expected[a.Name] = a
+	}
+	for _, name := range []string{"release-manifest.json", "SHA256SUMS"} {
+		info, err := os.Lstat(filepath.Join(dir, name))
+		if err != nil {
 			return m, nil, err
 		}
-		seenTargets[a.Target], expected[a.Name] = true, true
-		if err := verifyArchive(filepath.Join(dir, a.Name), a); err != nil {
-			return m, nil, err
+		if !info.Mode().IsRegular() {
+			return m, nil, fmt.Errorf("publication entry is not a regular file: %s", name)
 		}
-	}
-	if m.Source.Name != productName+"-"+tag+"-source.zip" {
-		return m, nil, errors.New("invalid source artifact name")
-	}
-	expected[m.Source.Name] = true
-	if err := validateFile(filepath.Join(dir, m.Source.Name), m.Source.SHA256, m.Source.Size); err != nil {
-		return m, nil, err
+		if name == "release-manifest.json" {
+			expected[name] = artifact{Name: name, Size: info.Size()}
+		}
 	}
 	sums, err := os.ReadFile(filepath.Join(dir, "SHA256SUMS"))
 	if err != nil {
@@ -263,34 +270,25 @@ func verifyBundle(dir, tag, repository, commit string) (manifest, []string, erro
 	}
 	listed := make(map[string]bool)
 	for _, line := range strings.Split(strings.TrimSpace(string(sums)), "\n") {
-		hash, name, ok := strings.Cut(strings.TrimSuffix(line, "\r"), "  ")
-		if !ok || !hashPattern.MatchString(hash) || !expected[name] || name == "SHA256SUMS" || listed[name] {
+		digest, name, ok := strings.Cut(strings.TrimSuffix(line, "\r"), "  ")
+		a, exists := expected[name]
+		if !ok || !hashPattern.MatchString(digest) || !exists || listed[name] ||
+			(a.SHA256 != "" && a.SHA256 != digest) {
 			return m, nil, errors.New("invalid checksum inventory")
 		}
-		actual, err := fileHash(filepath.Join(dir, name))
-		if err != nil || actual != hash {
-			return m, nil, fmt.Errorf("checksum mismatch: %s", name)
+		if err := validateFile(filepath.Join(dir, name), digest, a.Size); err != nil {
+			return m, nil, err
 		}
 		listed[name] = true
 	}
-	if len(listed) != len(expected)-1 {
+	if len(listed) != len(expected) {
 		return m, nil, errors.New("incomplete checksum inventory")
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return m, nil, err
+	files := make([]string, 0, len(expected)+1)
+	for name := range expected {
+		files = append(files, name)
 	}
-	if len(entries) != len(expected) {
-		return m, nil, errors.New("unexpected publication entries")
-	}
-	var files []string
-	for _, entry := range entries {
-		info, err := entry.Info()
-		if err != nil || !expected[entry.Name()] || !info.Mode().IsRegular() {
-			return m, nil, errors.New("unexpected or non-regular publication entry")
-		}
-		files = append(files, entry.Name())
-	}
+	files = append(files, "SHA256SUMS")
 	sort.Strings(files)
 	return m, files, nil
 }

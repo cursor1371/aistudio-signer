@@ -6,6 +6,7 @@
 /bin/
 /dist/
 /publish/
+/.release-cache/
 /state/
 /data/
 /cookies/

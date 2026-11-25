@@ -240,16 +240,13 @@ func unpack(archive, destination string) error {
 }
 
 func zipTree(source, destination string, stamp time.Time) error {
-	out, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	out, err := os.CreateTemp(filepath.Dir(destination), ".package-*.tmp")
 	if err != nil {
 		return err
 	}
-	ok := false
 	defer func() {
 		out.Close()
-		if !ok {
-			os.Remove(destination)
-		}
+		os.Remove(out.Name())
 	}()
 	z := zip.NewWriter(out)
 	if stamp.Before(time.Date(1980, 1, 1, 0, 0, 0, 0, time.UTC)) {
@@ -290,9 +287,13 @@ func zipTree(source, destination string, stamp time.Time) error {
 		_, err = io.Copy(writer, in)
 		return errors.Join(err, in.Close())
 	})
-	err = errors.Join(err, z.Close(), out.Close())
-	ok = err == nil
-	return err
+	if err = errors.Join(err, z.Close(), out.Close()); err != nil {
+		return err
+	}
+	if err := os.Chmod(out.Name(), 0644); err != nil {
+		return err
+	}
+	return os.Rename(out.Name(), destination)
 }
 
 func validateLibrary(root string) (string, error) {
@@ -312,16 +313,68 @@ func validateLibrary(root string) (string, error) {
 	return root, nil
 }
 
-func (t *tool) nativeLibrary(target, work string) (string, error) {
-	spec := t.lock.Native
-	name := "spidermonkey-" + spec.Version + "-" + target + ".tar.gz"
-	archive := filepath.Join(work, name)
-	u := "https://github.com/" + spec.Repository + "/releases/download/" + spec.Version + "/" + name
-	if err := download(t.ctx, u, archive, spec.SHA256[target]); err != nil {
+// Cache only pinned archives across CI runs. Extraction is committed after it
+// finishes; stable local paths also allow CGO to reuse its build cache.
+func (t *tool) dependencyDirectory(name, rawURL, digest string) (string, error) {
+	if filepath.Base(name) != name || strings.ContainsAny(name, "\\/:\r\n\x00") || !hashPattern.MatchString(digest) {
+		return "", errors.New("invalid cached dependency")
+	}
+	cache := filepath.Join(t.root, ".release-cache")
+	archive := filepath.Join(cache, "downloads", digest, name)
+	if info, err := os.Lstat(archive); err == nil {
+		if !info.Mode().IsRegular() {
+			return "", errors.New("cached archive is not a regular file")
+		}
+		actual, err := fileHash(archive)
+		if err != nil {
+			return "", err
+		}
+		if actual != digest {
+			return "", fmt.Errorf("cached archive checksum mismatch; remove %s and retry", archive)
+		}
+		fmt.Fprintln(os.Stderr, "cache:", name)
+	} else if errors.Is(err, os.ErrNotExist) {
+		if err := download(t.ctx, rawURL, archive, digest); err != nil {
+			return "", err
+		}
+	} else {
 		return "", err
 	}
-	root := filepath.Join(work, "spidermonkey")
-	if err := unpack(archive, root); err != nil {
+
+	base := filepath.Join(cache, "unpacked")
+	destination := filepath.Join(base, digest)
+	if info, err := os.Lstat(destination); err == nil {
+		if !info.IsDir() {
+			return "", errors.New("cached extraction is not a directory")
+		}
+		return destination, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	if err := os.MkdirAll(base, 0755); err != nil {
+		return "", err
+	}
+	stage, err := os.MkdirTemp(base, ".extract-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(stage)
+	payload := filepath.Join(stage, "files")
+	if err := unpack(archive, payload); err != nil {
+		return "", err
+	}
+	if err := os.Rename(payload, destination); err != nil {
+		return "", err
+	}
+	return destination, nil
+}
+
+func (t *tool) nativeLibrary(target string) (string, error) {
+	spec := t.lock.Native
+	name := "spidermonkey-" + spec.Version + "-" + target + ".tar.gz"
+	u := "https://github.com/" + spec.Repository + "/releases/download/" + spec.Version + "/" + name
+	root, err := t.dependencyDirectory(name, u, spec.SHA256[target])
+	if err != nil {
 		return "", err
 	}
 	return validateLibrary(root)

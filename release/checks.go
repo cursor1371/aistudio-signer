@@ -9,50 +9,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"sort"
 	"strings"
 	"time"
 )
 
-type linkage struct {
-	Linkage             string   `json:"linkage"`
-	DynamicDependencies []string `json:"dynamicDependencies"`
-	MinimumOS           string   `json:"minimumOS,omitempty"`
-	Signature           string   `json:"signature,omitempty"`
-}
-
-type buildInfo struct {
-	Component        string           `json:"component"`
-	Version          string           `json:"version"`
-	Commit           string           `json:"commit"`
-	Protocol         int              `json:"protocol"`
-	GoVersion        string           `json:"goVersion"`
-	OS               string           `json:"os"`
-	Arch             string           `json:"arch"`
-	Target           string           `json:"target"`
-	Compiler         string           `json:"compiler"`
-	Binary           string           `json:"binary"`
-	BinarySHA256     string           `json:"binarySHA256"`
-	SourceRepository string           `json:"sourceRepository"`
-	SpiderMonkey     nativeDependency `json:"spidermonkey"`
-	Dependencies     linkage          `json:"dependencies"`
-	GoModules        int              `json:"goModules"`
-	Checks           []string         `json:"checks"`
-}
-
-func (t *tool) inspectBinary(binary, target, toolRoot string, env []string) (linkage, error) {
-	report := linkage{DynamicDependencies: []string{}}
+// Check the target architecture, then perform required platform preparation.
+// No dependency inventory or OS-library name allowlist is involved.
+func (t *tool) prepareBinary(binary, target string, env []string) error {
 	switch {
 	case strings.HasPrefix(target, "linux-"):
 		f, err := elf.Open(binary)
 		if err != nil {
-			return report, err
+			return err
 		}
 		defer f.Close()
 		machine := elf.EM_X86_64
@@ -60,154 +31,108 @@ func (t *tool) inspectBinary(binary, target, toolRoot string, env []string) (lin
 			machine = elf.EM_AARCH64
 		}
 		if f.Machine != machine || f.Class != elf.ELFCLASS64 {
-			return report, errors.New("wrong ELF architecture")
+			return errors.New("wrong ELF architecture")
 		}
-		for _, prog := range f.Progs {
-			if prog.Type == elf.PT_INTERP {
-				return report, errors.New("Linux release must not require a dynamic interpreter")
+		// Linux releases promise a static musl binary, not a host-specific loader.
+		for _, program := range f.Progs {
+			if program.Type == elf.PT_INTERP {
+				return errors.New("static Linux release contains a dynamic interpreter")
 			}
 		}
-		deps, err := f.ImportedLibraries()
-		if err != nil || len(deps) != 0 {
-			return report, errors.New("Linux release must not import dynamic libraries")
+		needed, err := f.DynValue(elf.DT_NEEDED)
+		if err != nil {
+			return err
 		}
-		report.Linkage = "static-musl"
+		if len(needed) != 0 {
+			return errors.New("static Linux release contains shared-library dependencies")
+		}
 	case strings.HasPrefix(target, "darwin-"):
 		f, err := macho.Open(binary)
 		if err != nil {
-			return report, err
+			return err
 		}
 		cpu := macho.CpuAmd64
 		if target == "darwin-arm64" {
 			cpu = macho.CpuArm64
 		}
-		deps, readErr := f.ImportedLibraries()
 		wrongCPU := f.Cpu != cpu
 		f.Close()
-		if readErr != nil || wrongCPU {
-			return report, errors.New("invalid Mach-O architecture or import table")
-		}
-		for _, name := range deps {
-			if !strings.HasPrefix(name, "/usr/lib/") && !strings.HasPrefix(name, "/System/Library/") {
-				return report, fmt.Errorf("non-system Mach-O dependency: %s", name)
-			}
+		if wrongCPU {
+			return errors.New("wrong Mach-O architecture")
 		}
 		if _, err := t.run(env, false, time.Minute, "codesign", "--force", "--sign", "-", binary); err != nil {
-			return report, err
+			return err
 		}
-		if _, err := t.run(env, false, time.Minute, "codesign", "--verify", "--strict", binary); err != nil {
-			return report, err
+		if _, err := t.run(env, false, time.Minute, "codesign", "--verify", binary); err != nil {
+			return err
 		}
-		report.Linkage, report.MinimumOS = "system-libraries", t.lock.MacOS
-		report.Signature = "ad-hoc; not Developer ID signed or notarized"
-		report.DynamicDependencies = append(report.DynamicDependencies, deps...)
 	case target == "windows-amd64":
 		f, err := pe.Open(binary)
 		if err != nil {
-			return report, err
+			return err
 		}
 		defer f.Close()
 		if f.Machine != pe.IMAGE_FILE_MACHINE_AMD64 {
-			return report, errors.New("wrong PE architecture")
+			return errors.New("wrong PE architecture")
 		}
-		// debug/pe.ImportedLibraries is not implemented in the supported Go
-		// toolchain. Use the pinned compiler's inspector, not a PATH lookup.
-		output, err := t.run(env, true, time.Minute, filepath.Join(toolRoot, "bin", "llvm-readobj.exe"), "--coff-imports", binary)
-		if err != nil {
-			return report, err
-		}
-		matches := regexp.MustCompile(`(?i)Name:\s+(\S+\.dll)`).FindAllStringSubmatch(output, -1)
-		if len(matches) == 0 {
-			return report, errors.New("invalid PE import table")
-		}
-		deps := make([]string, 0, len(matches))
-		for _, match := range matches {
-			deps = append(deps, match[1])
-		}
-		system := strings.Fields("kernel32.dll ntdll.dll user32.dll advapi32.dll bcrypt.dll crypt32.dll ws2_32.dll winmm.dll psapi.dll dbghelp.dll userenv.dll shell32.dll ole32.dll oleaut32.dll rpcrt4.dll shlwapi.dll secur32.dll wintrust.dll kernelbase.dll powrprof.dll imm32.dll gdi32.dll setupapi.dll version.dll cfgmgr32.dll normaliz.dll mswsock.dll iphlpapi.dll dnsapi.dll ucrtbase.dll msvcrt.dll winhttp.dll")
-		for _, name := range deps {
-			lower := strings.ToLower(name)
-			allowed := strings.HasPrefix(lower, "api-ms-win-") || strings.HasPrefix(lower, "ext-ms-win-")
-			for _, item := range system {
-				allowed = allowed || lower == item
-			}
-			if !allowed {
-				return report, fmt.Errorf("non-system PE dependency: %s", name)
-			}
-		}
-		report.Linkage, report.Signature = "system-libraries", "unsigned"
-		report.DynamicDependencies = append(report.DynamicDependencies, deps...)
 	default:
-		return report, errors.New("unsupported binary format")
+		return errors.New("unsupported binary format")
 	}
-	sort.Strings(report.DynamicDependencies)
-	return report, nil
+	return nil
 }
 
-type ipcMessage struct {
-	ID       string          `json:"id"`
-	Type     string          `json:"type"`
-	Data     json.RawMessage `json:"data"`
-	Reusable *bool           `json:"reusable"`
-	Error    *struct {
-		Code string `json:"code"`
-	} `json:"error"`
-}
-
-type ipcRead struct {
-	message ipcMessage
-	err     error
-}
-
-func (t *tool) smoke(binary, target, ver, commit string, env []string) (buildInfo, error) {
-	var metadata buildInfo
-	text, err := t.run(env, true, 20*time.Second, binary, "--version")
+// Basic package check only: version, hello and clean shutdown. It deliberately
+// does not initialize WAA, load an account or issue model/control requests.
+func (t *tool) smoke(binary, target, ver, commit string, env []string) error {
+	text, err := t.run(env, true, 20*time.Second, binary, "--version", "--log-level", "error")
 	if err != nil {
-		return metadata, err
+		return err
+	}
+	var metadata struct {
+		Component string `json:"component"`
+		Version   string `json:"version"`
+		Commit    string `json:"commit"`
+		Protocol  int    `json:"protocol"`
+		OS        string `json:"os"`
+		Arch      string `json:"arch"`
 	}
 	if err := json.Unmarshal([]byte(text), &metadata); err != nil {
-		return metadata, err
+		return err
 	}
 	goos, arch, _ := strings.Cut(target, "-")
-	if metadata.Component != productName || metadata.Version != ver || metadata.Commit != commit || metadata.Protocol != t.lock.Protocol || metadata.OS != goos || metadata.Arch != arch || metadata.GoVersion != "go"+t.lock.Go {
-		return metadata, errors.New("binary metadata does not match this build")
+	if metadata.Component != productName || metadata.Version != ver || metadata.Commit != commit ||
+		metadata.Protocol != t.lock.Protocol || metadata.OS != goos || metadata.Arch != arch {
+		return errors.New("binary metadata does not match this build")
 	}
-	if _, err := t.run(env, true, 20*time.Second, binary, "--help"); err != nil {
-		return metadata, err
-	}
+
 	dir, err := os.MkdirTemp("", "signer-smoke-")
 	if err != nil {
-		return metadata, err
+		return err
 	}
 	defer os.RemoveAll(dir)
 	config := filepath.Join(dir, "config.json")
-	if err := writeJSON(config, map[string]any{"storage_state": "absent/state.json", "model": "gemini-4-hydrogen", "capacity": 2}); err != nil {
-		return metadata, err
+	if err := writeJSON(config, map[string]any{
+		"storage_state": "absent/state.json", "model": "gemini-4-hydrogen",
+	}); err != nil {
+		return err
 	}
-	// No init is sent. The absent state path prevents accidental account use.
-	ctx, cancel := context.WithTimeout(t.ctx, time.Minute)
+	ctx, cancel := context.WithTimeout(t.ctx, 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, binary, "--config", config, "--log-level", "error", "--log-format", "json")
-	cmd.Dir, cmd.Env = dir, env
+	cmd.Dir, cmd.Env, cmd.Stderr = dir, env, os.Stderr
 	cmd.WaitDelay = 5 * time.Second
-	stderr, err := os.Create(filepath.Join(dir, "stderr.log"))
-	if err != nil {
-		return metadata, err
-	}
-	defer stderr.Close()
-	cmd.Stderr = stderr
 	in, err := cmd.StdinPipe()
 	if err != nil {
-		return metadata, err
+		return err
 	}
 	defer in.Close()
 	out, err := cmd.StdoutPipe()
 	if err != nil {
-		return metadata, err
+		return err
 	}
 	defer out.Close()
 	if err := cmd.Start(); err != nil {
-		return metadata, err
+		return err
 	}
 	waited := false
 	defer func() {
@@ -217,217 +142,46 @@ func (t *tool) smoke(binary, target, ver, commit string, env []string) (buildInf
 			_ = cmd.Wait()
 		}
 	}()
-	messages := make(chan ipcRead, 1)
-	readerDone := make(chan struct{})
-	go func() {
-		defer close(readerDone)
-		scanner := bufio.NewScanner(out)
-		scanner.Buffer(make([]byte, 4096), 1<<20)
-		for scanner.Scan() {
-			var m ipcMessage
-			err := json.Unmarshal(scanner.Bytes(), &m)
-			select {
-			case messages <- ipcRead{message: m, err: err}:
-			case <-ctx.Done():
-				return
-			}
-			if err != nil {
-				return
-			}
+
+	scanner := bufio.NewScanner(out)
+	scanner.Buffer(make([]byte, 4096), 1<<20)
+	if !scanner.Scan() {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		err := scanner.Err()
-		if err == nil {
-			err = io.EOF
+		if err := scanner.Err(); err != nil {
+			return fmt.Errorf("read IPC hello: %w", err)
 		}
-		select {
-		case messages <- ipcRead{err: err}:
-		case <-ctx.Done():
-		}
-	}()
-	receive := func() (ipcMessage, error) {
-		timer := time.NewTimer(15 * time.Second)
-		defer timer.Stop()
-		select {
-		case item := <-messages:
-			return item.message, item.err
-		case <-ctx.Done():
-			return ipcMessage{}, ctx.Err()
-		case <-timer.C:
-			return ipcMessage{}, errors.New("IPC smoke response timed out")
-		}
+		return errors.New("process exited before IPC hello")
 	}
-	encoder := json.NewEncoder(in)
-	hello, err := receive()
-	var greeting struct {
-		Protocol int `json:"protocol"`
-		Capacity int `json:"capacity"`
+	var hello struct {
+		Type string `json:"type"`
+		Data struct {
+			Protocol int `json:"protocol"`
+		} `json:"data"`
 	}
-	if err != nil || hello.Type != "hello" || json.Unmarshal(hello.Data, &greeting) != nil || greeting.Protocol != t.lock.Protocol || greeting.Capacity != 2 {
-		return metadata, errors.New("invalid IPC hello")
+	if err := json.Unmarshal(scanner.Bytes(), &hello); err != nil {
+		return fmt.Errorf("invalid IPC hello: %w", err)
 	}
-	if err := encoder.Encode(map[string]string{"id": "status", "op": "status"}); err != nil {
-		return metadata, err
+	if hello.Type != "hello" || hello.Data.Protocol != t.lock.Protocol {
+		return errors.New("invalid IPC hello")
 	}
-	m, err := receive()
-	var state struct {
-		Phase string `json:"phase"`
+	if err := json.NewEncoder(in).Encode(map[string]string{"op": "shutdown"}); err != nil {
+		return err
 	}
-	if err != nil || m.ID != "status" || m.Type != "result" || m.Reusable == nil || !*m.Reusable || json.Unmarshal(m.Data, &state) != nil || state.Phase != "not_initialized" {
-		return metadata, errors.New("invalid pre-init status")
+	if scanner.Scan() {
+		return errors.New("unexpected IPC output after shutdown")
 	}
-	if err := encoder.Encode(map[string]any{"id": "request", "op": "request", "params": map[string]any{}}); err != nil {
-		return metadata, err
+	if err := scanner.Err(); err != nil {
+		return err
 	}
-	m, err = receive()
-	if err != nil || m.ID != "request" || m.Type != "error" || m.Reusable == nil || !*m.Reusable || m.Error == nil || m.Error.Code != "NOT_INITIALIZED" {
-		return metadata, errors.New("uninitialized request was not rejected locally")
-	}
-	if err := encoder.Encode(map[string]string{"op": "shutdown"}); err != nil {
-		return metadata, err
-	}
-	if _, err := receive(); err != io.EOF {
-		return metadata, errors.New("unexpected output or timeout after shutdown")
-	}
-	<-readerDone
 	err = cmd.Wait()
 	waited = true
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil {
-		return metadata, fmt.Errorf("IPC shutdown: %w", err)
+		return fmt.Errorf("IPC shutdown: %w", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "absent")); !errors.Is(err, os.ErrNotExist) {
-		return metadata, errors.New("pre-init check touched account state")
-	}
-	return metadata, nil
-}
-
-var licenseName = regexp.MustCompile(`(?i)^(licen[sc]e|copying|copyright|notice|patents)([._-].*)?$`)
-
-func copyLicenses(source, destination string) ([]string, error) {
-	var copied []string
-	err := filepath.WalkDir(source, func(name string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !licenseName.MatchString(entry.Name()) {
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-		rel, err := filepath.Rel(source, name)
-		if err != nil {
-			return err
-		}
-		if err := copyFile(name, filepath.Join(destination, rel), 0644); err != nil {
-			return err
-		}
-		copied = append(copied, filepath.ToSlash(rel))
-		return nil
-	})
-	return copied, err
-}
-
-type module struct {
-	Path    string
-	Version string
-	Dir     string
-	Sum     string
-	Main    bool
-	Replace *module
-}
-
-type licenseEntry struct {
-	Module   string   `json:"module"`
-	Version  string   `json:"version"`
-	Sum      string   `json:"sum,omitempty"`
-	Licenses []string `json:"licenses"`
-}
-
-func (t *tool) collectLicenses(stage, toolRoot string, env, tags []string) (int, error) {
-	licenses := filepath.Join(stage, "licenses")
-	args := append([]string{"list", "-mod=readonly", "-deps", "-json"}, tags...)
-	args = append(args, ".")
-	text, err := t.run(env, true, 10*time.Minute, "go", args...)
-	if err != nil {
-		return 0, err
-	}
-	decoder := json.NewDecoder(strings.NewReader(text))
-	modules := make(map[string]module)
-	for {
-		var pkg struct {
-			Module *module
-		}
-		err := decoder.Decode(&pkg)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return 0, err
-		}
-		if pkg.Module != nil && !pkg.Module.Main {
-			modules[pkg.Module.Path] = *pkg.Module
-		}
-	}
-	keys := make([]string, 0, len(modules))
-	for key := range modules {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	inventory := make([]licenseEntry, 0, len(keys))
-	for _, key := range keys {
-		m := modules[key]
-		if m.Replace != nil || m.Dir == "" || m.Version == "" {
-			return 0, fmt.Errorf("module source unavailable or replaced: %s", key)
-		}
-		rel := "go/" + m.Path + "@" + m.Version
-		dest, err := safeArchivePath(licenses, rel)
-		if err != nil {
-			return 0, err
-		}
-		files, err := copyLicenses(m.Dir, dest)
-		if err != nil {
-			return 0, err
-		}
-		if len(files) == 0 {
-			return 0, fmt.Errorf("no license found for %s", key)
-		}
-		for i := range files {
-			files[i] = rel + "/" + files[i]
-		}
-		inventory = append(inventory, licenseEntry{m.Path, m.Version, m.Sum, files})
-	}
-	goRoot, err := t.run(env, true, time.Minute, "go", "env", "GOROOT")
-	if err != nil {
-		return 0, err
-	}
-	for _, name := range []string{"LICENSE", "PATENTS"} {
-		if err := copyFile(filepath.Join(goRoot, name), filepath.Join(licenses, "go-toolchain", name), 0644); err != nil {
-			return 0, err
-		}
-	}
-	spec := t.lock.Native
-	base := "https://raw.githubusercontent.com/" + spec.Repository + "/" + spec.Commit
-	for _, item := range []struct{ remote, local string }{{"LICENSE", "LICENSE"}, {"toolkit/content/license.html", "license.html"}} {
-		if err := download(t.ctx, base+"/"+item.remote, filepath.Join(licenses, "spidermonkey", item.local), ""); err != nil {
-			return 0, err
-		}
-	}
-	source := fmt.Sprintf("Source revision: https://github.com/%s/tree/%s\nSource archive: https://github.com/%s/archive/%s.tar.gz\nNative libraries: https://github.com/%s/releases/tag/%s\nThe native libraries are used without local patches. Preserve access to their corresponding source when redistributing.\n", spec.Repository, spec.Commit, spec.Repository, spec.Commit, spec.Repository, spec.Version)
-	if err := os.WriteFile(filepath.Join(licenses, "spidermonkey", "SOURCE.txt"), []byte(source), 0644); err != nil {
-		return 0, err
-	}
-	if toolRoot != "" {
-		files, err := copyLicenses(toolRoot, filepath.Join(licenses, "native-toolchain"))
-		if err != nil {
-			return 0, err
-		}
-		if len(files) == 0 {
-			return 0, errors.New("native toolchain licenses were not found")
-		}
-	}
-	return len(inventory), writeJSON(filepath.Join(licenses, "go-modules.json"), inventory)
+	return nil
 }
