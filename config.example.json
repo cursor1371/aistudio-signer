@@ -1,0 +1,11 @@
+{
+  "storage_state": "state/account/storage-state.json",
+  "model": "gemini-4-hydrogen",
+  "auth_user": 0,
+  "proxy": "",
+  "locale": "",
+  "timezone": "",
+  "init_timeout_seconds": 120,
+  "sign_timeout_seconds": 30,
+  "capacity": 2
+}

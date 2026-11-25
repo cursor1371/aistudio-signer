@@ -1,0 +1,18 @@
+* text=auto
+*.go text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
+LICENSE text eol=lf
+NOTICE text eol=lf
+/docs export-ignore
+/docs/** export-ignore
+*.gz binary
+*.zip binary
+*.exe binary
+*.a binary
